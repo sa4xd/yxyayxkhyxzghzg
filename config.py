@@ -1,7 +1,7 @@
 import os
 
 # 端口号
-PORT = int(os.getenv("PORT", 443))
+PORT = int(os.getenv("PORT", 8443))
 
 # 用户列表：name -> secret（格式：tg:secret,tg2:secret2）
 raw_users = os.getenv("USERS", "tg:00000000000000000000000000000001")
