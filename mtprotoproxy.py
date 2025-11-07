@@ -1818,6 +1818,7 @@ async def handle_metrics(reader, writer):
 
 
 async def stats_printer():
+    return
     global user_stats
     global last_client_ips
     global last_clients_with_time_skew
@@ -1835,9 +1836,8 @@ async def stats_printer():
         print(flush=True)
 
         if last_client_ips:
-            print("New IPs:")
             for ip in last_client_ips:
-                print(ip)
+                pass
             print(flush=True)
             last_client_ips.clear()
 
