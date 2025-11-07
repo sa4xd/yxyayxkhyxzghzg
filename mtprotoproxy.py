@@ -2393,23 +2393,26 @@ async def periodic_stats_printer():
 def create_utilitary_tasks(loop):
     tasks = []
 
-    stats_printer_task = asyncio.Task(stats_printer(), loop=loop)
-    tasks.append(stats_printer_task)
-    tasks.append(periodic_stats_printer())
+    # 包装所有任务，确保异常不会导致挂起
+    def safe_task(coro):
+        async def wrapper():
+            try:
+                await coro
+            except Exception as e:
+                print_err(f"[Background Task Error] {coro.__name__}: {e}")
+        return loop.create_task(wrapper())
+
+    tasks.append(safe_task(stats_printer()))
+    tasks.append(safe_task(periodic_stats_printer()))
+    tasks.append(safe_task(periodic_health_check()))
 
     if config.USE_MIDDLE_PROXY:
-        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info(), loop=loop)
-        tasks.append(middle_proxy_updater_task)
-
+        tasks.append(safe_task(update_middle_proxy_info()))
         if config.GET_TIME_PERIOD:
-            time_get_task = asyncio.Task(get_srv_time(), loop=loop)
-            tasks.append(time_get_task)
+            tasks.append(safe_task(get_srv_time()))
 
-    get_cert_len_task = asyncio.Task(get_mask_host_cert_len(), loop=loop)
-    tasks.append(get_cert_len_task)
-
-    clear_resolving_cache_task = asyncio.Task(clear_ip_resolving_cache(), loop=loop)
-    tasks.append(clear_resolving_cache_task)
+    tasks.append(safe_task(get_mask_host_cert_len()))
+    tasks.append(safe_task(clear_ip_resolving_cache()))
 
     return tasks
 
@@ -2484,6 +2487,25 @@ async def health_check():
             
         except Exception as e:
             logger.error(f"健康检查任务出错: {e}")
+def check_mtp_proxy(host="127.0.0.1", timeout=5):
+    port = getattr(config, "PORT", 443)  # 默认443，防止未初始化
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.send(b"\xee\xee\xee\xee")  # Intermediate protocol tag
+        time.sleep(1)
+        s.close()
+        return True
+    except Exception as e:
+        print_err(f"[MTP Check] Failed: {e}")
+        return False
+async def periodic_health_check():
+    while True:
+        if check_mtp_proxy():
+            print_err("[Health] Proxy is responsive")
+        else:
+            print_err("[Health] Proxy is unresponsive")
+        await asyncio.sleep(60)
+
 def main():
     init_config()
     ensure_users_in_user_stats()
@@ -2539,4 +2561,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()
