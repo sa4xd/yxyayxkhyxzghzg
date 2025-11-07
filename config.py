@@ -19,6 +19,6 @@ MODES = {
 # TLS 模式下的伪装域名
 TLS_DOMAIN = os.getenv("TLS_DOMAIN", "cloudflare.com")
 
-# 广告标签，从 @MTProxybot 获取
-AD_TAG = os.getenv("AD_TAG")
-assert AD_TAG, "Environment variable AD_TAG must be set"
+# # 广告标签，从 @MTProxybot 获取
+# AD_TAG = os.getenv("AD_TAG")
+# assert AD_TAG, "Environment variable AD_TAG must be set"
