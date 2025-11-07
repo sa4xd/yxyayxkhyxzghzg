@@ -19,45 +19,7 @@ import signal
 import os
 import stat
 import traceback
-import logging
-from logging.handlers import RotatingFileHandler
-# 配置详细日志
-def setup_logging():
-    """设置详细日志记录"""
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    log_formatter = logging.Formatter(log_format)
-    
-    # 控制台日志
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setFormatter(log_formatter)
-    console_handler.setLevel(logging.INFO)
-    
-    # 文件日志（轮转，最大10MB，保留5个备份）
-    file_handler = RotatingFileHandler(
-        'mtproto_proxy.log', 
-        maxBytes=10*1024*1024, 
-        backupCount=5,
-        encoding='utf-8'
-    )
-    file_handler.setFormatter(log_formatter)
-    file_handler.setLevel(logging.DEBUG)
-    
-    # 根日志记录器
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-    
-    return logging.getLogger(__name__)
 
-logger = setup_logging()
-
-# 修改print_err函数
-def print_err(*params):
-    """增强错误打印函数"""
-    error_msg = ' '.join(str(p) for p in params)
-    logger.error(error_msg)
-    print(*params, file=sys.stderr, flush=True)
 
 TG_DATACENTER_PORT = 443
 
@@ -135,6 +97,7 @@ stats = collections.Counter()
 user_stats = collections.defaultdict(collections.Counter)
 
 config = {}
+
 
 def init_config():
     global config
@@ -522,75 +485,52 @@ myrandom = MyRandom()
 
 class TgConnectionPool:
     MAX_CONNS_IN_POOL = 64
-    CLEANUP_INTERVAL = 300  # 每 5 分钟清理一次
-    CONN_TIMEOUT = 10       # Telegram 连接超时时间
 
     def __init__(self):
-        self.pools = {}  # {(host, port, init_func): [ConnectionEntry]}
-        self.last_cleanup = time.time()
-
-    class ConnectionEntry:
-        def __init__(self, task):
-            self.task = task
-            self.created_at = time.time()
-
-        def is_expired(self):
-            return self.task.done() and (
-                self.task.exception() or
-                self.task.result()[1].transport.is_closing()
-            )
+        self.pools = {}
 
     async def open_tg_connection(self, host, port, init_func=None):
-        try:
-            task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
-            reader, writer = await asyncio.wait_for(task, timeout=self.CONN_TIMEOUT)
+        task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
+        reader_tgt, writer_tgt = await asyncio.wait_for(task, timeout=config.TG_CONNECT_TIMEOUT)
 
-            set_keepalive(writer.get_extra_info("socket"))
-            set_bufsizes(writer.get_extra_info("socket"), get_to_clt_bufsize(), get_to_tg_bufsize())
+        set_keepalive(writer_tgt.get_extra_info("socket"))
+        set_bufsizes(writer_tgt.get_extra_info("socket"), get_to_clt_bufsize(), get_to_tg_bufsize())
 
-            if init_func:
-                return await asyncio.wait_for(init_func(host, port, reader, writer), timeout=self.CONN_TIMEOUT)
-            return reader, writer
-        except Exception as e:
-            print_err(f"Failed to open connection to {host}:{port} - {e}")
-            raise
+        if init_func:
+            return await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
+                                          timeout=config.TG_CONNECT_TIMEOUT)
+        return reader_tgt, writer_tgt
 
     def register_host_port(self, host, port, init_func):
-        key = (host, port, init_func)
-        pool = self.pools.setdefault(key, [])
+        if (host, port, init_func) not in self.pools:
+            self.pools[(host, port, init_func)] = []
 
-        while len(pool) < self.MAX_CONNS_IN_POOL:
-            task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
-            pool.append(self.ConnectionEntry(task))
-
-    def cleanup_pool(self):
-        now = time.time()
-        if now - self.last_cleanup < self.CLEANUP_INTERVAL:
-            return
-        self.last_cleanup = now
-
-        for key, pool in self.pools.items():
-            self.pools[key] = [entry for entry in pool if not entry.is_expired()]
+        while len(self.pools[(host, port, init_func)]) < TgConnectionPool.MAX_CONNS_IN_POOL:
+            connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
+            self.pools[(host, port, init_func)].append(connect_task)
 
     async def get_connection(self, host, port, init_func=None):
-        self.cleanup_pool()
         self.register_host_port(host, port, init_func)
 
-        key = (host, port, init_func)
-        pool = self.pools[key]
+        ret = None
+        for task in self.pools[(host, port, init_func)][::]:
+            if task.done():
+                if task.exception():
+                    self.pools[(host, port, init_func)].remove(task)
+                    continue
 
-        for entry in pool[:]:
-            if entry.task.done():
-                try:
-                    result = entry.task.result()
-                    writer = result[1]
-                    if not writer.transport.is_closing():
-                        pool.remove(entry)
-                        return result
-                except Exception:
-                    pool.remove(entry)
+                reader, writer, *other = task.result()
+                if writer.transport.is_closing():
+                    self.pools[(host, port, init_func)].remove(task)
+                    continue
 
-        # 没有可用连接，重新建立
+                if not ret:
+                    self.pools[(host, port, init_func)].remove(task)
+                    ret = (reader, writer, *other)
+
+        self.register_host_port(host, port, init_func)
+        if ret:
+            return ret
         return await self.open_tg_connection(host, port, init_func)
 
 
@@ -1755,40 +1695,16 @@ async def handle_client(reader_clt, writer_clt):
 
 
 async def handle_client_wrapper(reader, writer):
-    """增强的客户端处理包装器，带详细日志"""
-    client_ip = writer.get_extra_info("peername")[0] if writer.get_extra_info("peername") else "unknown"
-    start_time = time.time()
-    
     try:
-        logger.info(f"客户端连接开始: {client_ip}")
         await handle_client(reader, writer)
-        logger.info(f"客户端连接正常结束: {client_ip}, 耗时: {time.time() - start_time:.2f}s")
-        
-    except asyncio.IncompleteReadError as e:
-        logger.warning(f"客户端连接不完整读取错误: {client_ip}, 可能客户端断开: {e}")
-        
-    except asyncio.CancelledError:
-        logger.info(f"客户端连接被取消: {client_ip}")
-        
-    except ConnectionResetError as e:
-        logger.warning(f"客户端连接被重置: {client_ip}, 错误: {e}")
-        
-    except TimeoutError as e:
-        logger.warning(f"客户端连接超时: {client_ip}, 错误: {e}")
-        
-    except BrokenPipeError as e:
-        logger.warning(f"客户端管道破裂: {client_ip}, 错误: {e}")
-        
-    except Exception as e:
-        logger.error(f"客户端连接未预期错误: {client_ip}, 错误类型: {type(e).__name__}, 错误: {e}")
-        logger.error(f"详细堆栈信息:\n{traceback.format_exc()}")
-        
+    except (asyncio.IncompleteReadError, asyncio.CancelledError):
+        pass
+    except (ConnectionResetError, TimeoutError, BrokenPipeError):
+        pass
+    except Exception:
+        traceback.print_exc()
     finally:
-        logger.debug(f"客户端连接清理: {client_ip}")
-        try:
-            writer.transport.abort()
-        except Exception as e:
-            logger.error(f"清理客户端连接时出错: {client_ip}, 错误: {e}")
+        writer.transport.abort()
 
 
 def make_metrics_pkt(metrics):
@@ -2384,127 +2300,29 @@ def create_servers(loop):
 
     return servers
 
-async def periodic_stats_printer():
-    while True:
-        print_err(f"[Stats] Active connects: {get_curr_connects_count()}, Total: {stats['connects']}")
-        print_err(f"[Stats] Errors: {stats['connect_errors']}, Timeouts: {stats['timeouts']}")
-        await asyncio.sleep(config.STATS_PRINT_PERIOD)
 
 def create_utilitary_tasks(loop):
     tasks = []
 
-    # 包装所有任务，确保异常不会导致挂起
-    def safe_task(coro):
-        async def wrapper():
-            try:
-                await coro
-            except Exception as e:
-                print_err(f"[Background Task Error] {coro.__name__}: {e}")
-        return loop.create_task(wrapper())
-
-    tasks.append(safe_task(stats_printer()))
-    tasks.append(safe_task(periodic_stats_printer()))
-    tasks.append(safe_task(periodic_health_check()))
+    stats_printer_task = asyncio.Task(stats_printer(), loop=loop)
+    tasks.append(stats_printer_task)
 
     if config.USE_MIDDLE_PROXY:
-        tasks.append(safe_task(update_middle_proxy_info()))
-        if config.GET_TIME_PERIOD:
-            tasks.append(safe_task(get_srv_time()))
+        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info(), loop=loop)
+        tasks.append(middle_proxy_updater_task)
 
-    tasks.append(safe_task(get_mask_host_cert_len()))
-    tasks.append(safe_task(clear_ip_resolving_cache()))
+        if config.GET_TIME_PERIOD:
+            time_get_task = asyncio.Task(get_srv_time(), loop=loop)
+            tasks.append(time_get_task)
+
+    get_cert_len_task = asyncio.Task(get_mask_host_cert_len(), loop=loop)
+    tasks.append(get_cert_len_task)
+
+    clear_resolving_cache_task = asyncio.Task(clear_ip_resolving_cache(), loop=loop)
+    tasks.append(clear_resolving_cache_task)
 
     return tasks
 
-async def connection_monitor():
-    """连接监控任务，定期检查系统状态"""
-    logger.info("连接监控任务启动")
-    
-    while True:
-        try:
-            # 每分钟检查一次
-            await asyncio.sleep(60)
-            
-            # 检查当前连接数
-            total_connects = stats.get("connects_all", 0)
-            bad_connects = stats.get("connects_bad", 0)
-            handshake_timeouts = stats.get("handshake_timeouts", 0)
-            
-            # 检查用户统计
-            active_users = len([u for u, s in user_stats.items() if s.get("curr_connects", 0) > 0])
-            total_curr_connects = sum(s.get("curr_connects", 0) for s in user_stats.values())
-            
-            # 内存使用情况（如果可用）
-            try:
-                import psutil
-                memory = psutil.virtual_memory()
-                memory_info = f", 内存使用: {memory.percent}%"
-            except ImportError:
-                memory_info = ""
-            
-            logger.info(
-                f"系统状态 - 总连接: {total_connects}, "
-                f"坏连接: {bad_connects}, "
-                f"握手超时: {handshake_timeouts}, "
-                f"活跃用户: {active_users}, "
-                f"当前连接: {total_curr_connects}"
-                f"{memory_info}"
-            )
-            
-            # 检查后台任务状态
-            tasks = [t for t in asyncio.all_tasks() if not t.done()]
-            logger.debug(f"活跃异步任务数: {len(tasks)}")
-            
-            # 如果有大量连接失败，发出警告
-            if total_connects > 100 and bad_connects / total_connects > 0.3:
-                logger.warning(f"连接失败率过高: {bad_connects/total_connects*100:.1f}%")
-                
-        except Exception as e:
-            logger.error(f"连接监控任务出错: {e}")
-            logger.error(traceback.format_exc())
-
-async def health_check():
-    """健康检查任务，验证关键功能"""
-    logger.info("健康检查任务启动")
-    
-    while True:
-        try:
-            await asyncio.sleep(300)  # 每5分钟检查一次
-            
-            # 检查时间同步
-            if is_time_skewed:
-                logger.warning("检测到时间偏差，可能影响重放攻击保护")
-            
-            # 检查中间代理状态
-            if disable_middle_proxy:
-                logger.warning("中间代理被禁用，可能影响广告功能")
-            
-            # 检查IP信息
-            if not my_ip_info.get("ipv4") and not my_ip_info.get("ipv6"):
-                logger.warning("无法获取本机IP信息，可能影响代理功能")
-                
-            logger.debug("健康检查通过")
-            
-        except Exception as e:
-            logger.error(f"健康检查任务出错: {e}")
-def check_mtp_proxy(host="127.0.0.1", timeout=5):
-    port = getattr(config, "PORT", 443)  # 默认443，防止未初始化
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.send(b"\xee\xee\xee\xee")  # Intermediate protocol tag
-        time.sleep(1)
-        s.close()
-        return True
-    except Exception as e:
-        print_err(f"[MTP Check] Failed: {e}")
-        return False
-async def periodic_health_check():
-    while True:
-        if check_mtp_proxy():
-            print_err("[Health] Proxy is responsive")
-        else:
-            print_err("[Health] Proxy is unresponsive")
-        await asyncio.sleep(60)
 
 def main():
     init_config()
@@ -2561,5 +2379,4 @@ def main():
 
 
 if __name__ == "__main__":
-    
     main()
