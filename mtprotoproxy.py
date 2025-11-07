@@ -2323,7 +2323,6 @@ def create_utilitary_tasks(loop):
 
     return tasks
 
-
 def main():
     import logging
     logging.basicConfig(level=logging.INFO)
@@ -2347,17 +2346,23 @@ def main():
         loop = asyncio.new_event_loop()
 
     asyncio.set_event_loop(loop)
-    loop.set_exception_handler(loop_exception_han
+    loop.set_exception_handler(loop_exception_handler)
+
+    # 启动后台任务（如定时更新中间代理、统计打印等）
     utilitary_tasks = create_utilitary_tasks(loop)
     for task in utilitary_tasks:
-        async
+        asyncio.ensure_future(task)
+
+    # 启动主服务监听
     servers = create_servers(loop)
 
+    # 启动保活任务：定期 ping 所有连接
     async def keepalive_task():
         while True:
             try:
                 for user, stat in user_stats.items():
                     if stat["curr_connects"] > 0:
+                        # 可自定义 ping 数据或触发机制
                         logging.debug(f"Keepalive: {user} has {stat['curr_connects']} connections")
                 await asyncio.sleep(config.CLIENT_KEEPALIVE)
             except Exception as e:
@@ -2366,7 +2371,7 @@ def main():
 
     asyncio.ensure_future(keepalive_task())
 
-
+    # 持续运行，自动恢复
     try:
         logging.info("Proxy started. Running forever...")
         loop.run_forever()
@@ -2395,6 +2400,7 @@ def main():
 
         loop.close()
         logging.info("Proxy shutdown complete.")
+
 
 
 if __name__ == "__main__":
