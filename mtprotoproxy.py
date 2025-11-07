@@ -2325,6 +2325,9 @@ def create_utilitary_tasks(loop):
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
     init_config()
     ensure_users_in_user_stats()
     apply_upstream_proxy_settings()
@@ -2344,38 +2347,54 @@ def main():
         loop = asyncio.new_event_loop()
 
     asyncio.set_event_loop(loop)
-    loop.set_exception_handler(loop_exception_handler)
-
+    loop.set_exception_handler(loop_exception_han
     utilitary_tasks = create_utilitary_tasks(loop)
     for task in utilitary_tasks:
-        asyncio.ensure_future(task)
-
+        async
     servers = create_servers(loop)
 
+    async def keepalive_task():
+        while True:
+            try:
+                for user, stat in user_stats.items():
+                    if stat["curr_connects"] > 0:
+                        logging.debug(f"Keepalive: {user} has {stat['curr_connects']} connections")
+                await asyncio.sleep(config.CLIENT_KEEPALIVE)
+            except Exception as e:
+                logging.warning(f"Keepalive error: {e}")
+                await asyncio.sleep(5)
+
+    asyncio.ensure_future(keepalive_task())
+
+
     try:
+        logging.info("Proxy started. Running forever...")
         loop.run_forever()
     except KeyboardInterrupt:
-        pass
+        logging.info("Proxy interrupted by user.")
+    except Exception as e:
+        logging.error(f"Proxy crashed: {e}")
+    finally:
+        logging.info("Cleaning up...")
 
-    if hasattr(asyncio, "all_tasks"):
-        tasks = asyncio.all_tasks(loop)
-    else:
-        # for compatibility with Python 3.6
-        tasks = asyncio.Task.all_tasks(loop)
+        if hasattr(asyncio, "all_tasks"):
+            tasks = asyncio.all_tasks(loop)
+        else:
+            tasks = asyncio.Task.all_tasks(loop)
 
-    for task in tasks:
-        task.cancel()
+        for task in tasks:
+            task.cancel()
 
-    for server in servers:
-        server.close()
-        loop.run_until_complete(server.wait_closed())
+        for server in servers:
+            server.close()
+            loop.run_until_complete(server.wait_closed())
 
-    has_unix = hasattr(socket, "AF_UNIX")
+        has_unix = hasattr(socket, "AF_UNIX")
+        if config.LISTEN_UNIX_SOCK and has_unix:
+            remove_unix_socket(config.LISTEN_UNIX_SOCK)
 
-    if config.LISTEN_UNIX_SOCK and has_unix:
-        remove_unix_socket(config.LISTEN_UNIX_SOCK)
-
-    loop.close()
+        loop.close()
+        logging.info("Proxy shutdown complete.")
 
 
 if __name__ == "__main__":
